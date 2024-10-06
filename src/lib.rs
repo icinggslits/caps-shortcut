@@ -1,14 +1,19 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+pub use rdev::Key;
+
+
+mod listener;
+
+pub use listener::caps_with;
+pub use listener::run;
+pub use listener::caps_of_modifier_key_with;
+pub use listener::caps_listener_with;
+
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
+    
     #[test]
     fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+        
     }
 }
