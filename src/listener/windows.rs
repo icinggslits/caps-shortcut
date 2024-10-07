@@ -1,9 +1,9 @@
-use std::borrow::Borrow;
+#![allow(unused)]
+
 use std::collections::HashMap;
 use std::ptr::null_mut;
-use std::sync::{atomic, Arc, Mutex, OnceLock, RwLock};
+use std::sync::{atomic, OnceLock, RwLock};
 use std::sync::atomic::AtomicBool;
-use lock_keys::LockKeyWrapper;
 use rdev::Key;
 use winapi::um::winuser::{CallNextHookEx, GetAsyncKeyState, GetKeyState, GetMessageW, SendInput, SetWindowsHookExW, HC_ACTION, INPUT, INPUT_KEYBOARD, KBDLLHOOKSTRUCT, KEYEVENTF_KEYUP, VK_CAPITAL, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP};
 use winapi::shared::minwindef::{LRESULT, WPARAM, LPARAM, HINSTANCE};
@@ -25,8 +25,10 @@ static PRESSED_SHIFT: AtomicBool = AtomicBool::new(false);
 static PRESSED_ALT: AtomicBool = AtomicBool::new(false);
 static PRESSED_META: AtomicBool = AtomicBool::new(false);
 static PRESSED_CAPITAL: AtomicBool = AtomicBool::new(false);
-/// 需要还原大写锁定
-static NEED_RESTORE: AtomicBool = AtomicBool::new(false);
+/// 存在非Caps按键输入
+static OTHER_KEY_INPUT: AtomicBool = AtomicBool::new(false);
+
+static SELF_LOCK: AtomicBool = AtomicBool::new(false);
 
 
 struct Win;
@@ -62,18 +64,6 @@ impl Win {
     }
     fn input_caps() {
         unsafe {
-            // 获取Caps Lock键的状态
-            // let caps_lock_state = GetKeyState(VK_CAPITAL) & 0x0001;
-    
-            // 如果Caps Lock是开启的，就按下再释放Caps Lock键进行切换
-            // if caps_lock_state == 0 {
-            //     println!("Caps Lock is off, turning it on...");
-            // } else {
-            //     println!("Caps Lock is on, turning it off...");
-            // }
-    
-            // println!("{}", caps_lock_state);
-    
             // 模拟按下Caps Lock键
             let mut inputs = [
                 INPUT {
@@ -98,32 +88,16 @@ impl Win {
         }
     }
 
-    fn keyboard_keyed(code: u32, keydown: bool) -> Keyboard {
+    fn keyboard_keyed(code: u32, _keydown: bool) -> Keyboard {
         let key =  code_to_key(code);
 
-        let mut keyboard = Keyboard { 
-            ctrl: Win::ctrl(),
-            shift: Win::shift(),
-            alt: Win::alt(),
-            meta: Win::meta(),
-            key: code_to_key(code),
+        let keyboard = Keyboard { 
+            ctrl: PRESSED_CTRL.load(atomic::Ordering::Relaxed),
+            shift: PRESSED_SHIFT.load(atomic::Ordering::Relaxed),
+            alt: PRESSED_ALT.load(atomic::Ordering::Relaxed),
+            meta: PRESSED_META.load(atomic::Ordering::Relaxed),
+            key,
         };
-
-        match key {
-            Key::ControlLeft | Key::ControlRight => {
-                keyboard.ctrl = keydown;
-            },
-            Key::ShiftLeft | Key::ShiftRight => {
-                keyboard.shift = keydown;
-            },
-            Key::Alt | Key::AltGr => {
-                keyboard.alt = keydown;
-            }
-            Key::MetaLeft | Key::MetaRight => {
-                keyboard.meta = keydown;
-            },
-            _ => (),
-        }
 
         keyboard
     }
@@ -131,101 +105,109 @@ impl Win {
 
 
 unsafe extern "system" fn hook_proc(code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
-    
-    if code == HC_ACTION as i32 {
-        let kb_struct = *(l_param as *const KBDLLHOOKSTRUCT);
-        
-
-        if w_param == WM_KEYDOWN as WPARAM || w_param == 260 {
-            let vk_code = kb_struct.vkCode as i32;
-            let vk_code_u32 = kb_struct.vkCode;
-
-            let mut intercept = false;
-
-            match vk_code {
-                VK_LCONTROL | VK_RCONTROL | VK_CONTROL => {
-                    // PRESSED_CTRL.store(true, atomic::Ordering::Relaxed);
-                },
-                VK_LSHIFT | VK_RSHIFT | VK_SHIFT => {
-                    // PRESSED_SHIFT.store(true, atomic::Ordering::Relaxed);
-                },
-                VK_LMENU | VK_RMENU | VK_MENU => {
-                    // PRESSED_ALT.store(true, atomic::Ordering::Relaxed);
-                },
-                VK_LWIN | VK_RWIN => {
-                    // PRESSED_META.store(true, atomic::Ordering::Relaxed);
-                },
-                VK_CAPITAL => {
-                    PRESSED_CAPITAL.store(true, atomic::Ordering::Relaxed);
-                }
-                _ => ()
-            }
-
-            // {
-            //     let keyboard = Win::keyboard_keyed(vk_code_u32, true);
-            //     println!("按下 ctrl: {}, shift: {}, alt: {}, meta: {}, key: {:?}", keyboard.ctrl, keyboard.shift, keyboard.alt, keyboard.meta, keyboard.key);
-            // }
-
-
+    let self_lock = SELF_LOCK.load(atomic::Ordering::Relaxed);
+    if !self_lock {
+        if code == HC_ACTION as i32 {
+            let kb_struct = *(l_param as *const KBDLLHOOKSTRUCT);
             
-            let caps = PRESSED_CAPITAL.load(atomic::Ordering::Relaxed);
-            // let caps = Win::capital();
-            if caps {
-                let mut caps_listener = caps_listener_global().write().unwrap();
-                for f in caps_listener.iter_mut() {
-                    
-                    let keyboard = Win::keyboard_keyed(vk_code_u32, true);
-                    
-                    let _intercept = f(keyboard);
     
-                    if !intercept && _intercept {
+            if w_param == WM_KEYDOWN as WPARAM || w_param == 260 {
+                let vk_code = kb_struct.vkCode as i32;
+                let vk_code_u32 = kb_struct.vkCode;
+    
+                let mut intercept = false;
+    
+                let pressed_capital = PRESSED_CAPITAL.load(atomic::Ordering::Relaxed);
+                
+                match vk_code {
+                    VK_CAPITAL => {
+                        PRESSED_CAPITAL.store(true, atomic::Ordering::Relaxed);
+                        return 1
+                    }
+                    VK_MENU | VK_LMENU | VK_RMENU => {
+                        PRESSED_ALT.store(true, atomic::Ordering::Relaxed);
+                        if pressed_capital {
+                            return 1
+                        }
+                    }
+                    VK_CONTROL | VK_LCONTROL | VK_RCONTROL => {
+                        PRESSED_CTRL.store(true, atomic::Ordering::Relaxed);
+                        if pressed_capital {
+                            return 1
+                        }
+                    }
+                    VK_SHIFT | VK_LSHIFT | VK_RSHIFT => {
+                        PRESSED_SHIFT.store(true, atomic::Ordering::Relaxed);
+                        if pressed_capital {
+                            return 1
+                        }
+                    }
+                    VK_LWIN | VK_RWIN => {
+                        PRESSED_META.store(true, atomic::Ordering::Relaxed);
+                        if pressed_capital {
+                            return 1
+                        }
+                    }
+                    _ => {
+                        if pressed_capital {
+                            OTHER_KEY_INPUT.store(true, atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+
+                if pressed_capital {
+                    let mut caps_listener = caps_listener_global().write().unwrap();
+                    for f in caps_listener.iter_mut() {
                         
-                        intercept = true;
-                    }
-                    
-                }
-            }
-
-            if intercept {
-                NEED_RESTORE.store(true, atomic::Ordering::Relaxed);
-                return 1
-            }
-            
-        } else if w_param == WM_KEYUP as WPARAM || w_param == 261 {
-
-            let vk_code = kb_struct.vkCode as i32;
-            // let vk_code_u32 = kb_struct.vkCode;
-            
-            // let Keyboard {ctrl, shift, alt, meta, ..} = &Win::keyboard_keyed(vk_code_u32, false);
-            
-            // println!("松开 ctrl: {}, shift: {}, alt: {}, meta: {}, CAPS {}", ctrl, shift, alt, meta, Win::capital());
-
-            
-            match vk_code {
-                VK_LCONTROL | VK_RCONTROL | VK_CONTROL => {
-                    // PRESSED_CTRL.store(false, atomic::Ordering::Relaxed);
-                },
-                VK_LSHIFT | VK_RSHIFT | VK_SHIFT => {
-                    // PRESSED_SHIFT.store(false, atomic::Ordering::Relaxed);
-                }
-                VK_LMENU | VK_RMENU | VK_MENU => {
-                    // PRESSED_ALT.store(false, atomic::Ordering::Relaxed);
-                },
-                VK_LWIN | VK_RWIN => {
-                    // PRESSED_META.store(false, atomic::Ordering::Relaxed);
-                },
-                VK_CAPITAL => {
-                    PRESSED_CAPITAL.store(false, atomic::Ordering::Relaxed);
-                    if NEED_RESTORE.load(atomic::Ordering::Relaxed) {
-                        std::thread::spawn(|| {
-                            Win::input_caps();
-                        });
-                        NEED_RESTORE.store(false, atomic::Ordering::Relaxed);
+                        let keyboard = Win::keyboard_keyed(vk_code_u32, true);
+                        
+                        let _intercept = f(keyboard);
+        
+                        if !intercept && _intercept {
+                            
+                            intercept = true;
+                        }
+                        
                     }
                 }
-                _ => (),
+    
+                if intercept {
+                    return 1
+                }
+                
+            } else if w_param == WM_KEYUP as WPARAM || w_param == 261 {
+    
+                let vk_code = kb_struct.vkCode as i32;    
+                
+                match vk_code {
+                    VK_CAPITAL => {
+                        PRESSED_CAPITAL.store(false, atomic::Ordering::Relaxed);
+                        if !OTHER_KEY_INPUT.load(atomic::Ordering::Relaxed) {
+                            SELF_LOCK.store(true, atomic::Ordering::Relaxed);
+                            std::thread::spawn(|| {
+                                Win::input_caps();
+                                SELF_LOCK.store(false, atomic::Ordering::Relaxed);
+                            });
+                            // NEED_RESTORE.store(false, atomic::Ordering::Relaxed);
+                        }
+                        OTHER_KEY_INPUT.store(false, atomic::Ordering::Relaxed);
+                    }
+                    VK_MENU | VK_LMENU | VK_RMENU => {
+                        PRESSED_ALT.store(false, atomic::Ordering::Relaxed);
+                    }
+                    VK_CONTROL | VK_LCONTROL | VK_RCONTROL => {
+                        PRESSED_CTRL.store(false, atomic::Ordering::Relaxed);
+                    }
+                    VK_SHIFT | VK_LSHIFT | VK_RSHIFT => {
+                        PRESSED_SHIFT.store(false, atomic::Ordering::Relaxed);
+                    }
+                    VK_LWIN | VK_RWIN => {
+                        PRESSED_META.store(false, atomic::Ordering::Relaxed);
+                    }
+                    _ => (),
+                }
+                
             }
-            
         }
     }
     // 继续执行下一个钩子
@@ -248,13 +230,35 @@ fn caps_listener_global() -> &'static RwLock<Vec<Box<dyn FnMut(Keyboard) -> bool
     })
 }
 
-
-pub fn caps_with<F: FnMut() + 'static>(key: Key, f: F) {
+/// 设置按下`Caps` + `key` 时触发的回调
+/// 
+/// 如果按下了其他修饰键，不会生效
+/// 
+/// # Examples
+/// 
+/// ```
+/// use caps_shortcut::Key;
+/// caps_shortcut::caps_with(Key::KeyU, || {
+///      println!("Cpas and KeyU pressed");
+/// });
+/// // caps_shortcut::run();
+/// ```
+pub fn caps_with<F: FnMut() + Send + Sync + 'static>(key: Key, f: F) {
     caps_of_modifier_key_with(key, [], f);
 }
 
-pub fn caps_of_modifier_key_with<I: IntoIterator<Item = Key>, F: FnMut() + 'static>(key: Key, modifier_key: I, f: F) {
-    let code = key_to_code(key);
+/// 设置按下`Caps` + `key` ，并带有修饰键时触发的回调
+/// 
+/// # Examples
+/// 
+/// ```
+/// use caps_shortcut::Key;
+/// caps_shortcut::caps_of_modifier_key_with(Key::KeyI, [Key::Alt, Key::ControlLeft], || {
+///      println!("Cpas, Control, Alt and KeyI pressed");
+/// });
+/// // caps_shortcut::run();
+/// ```
+pub fn caps_of_modifier_key_with<I: IntoIterator<Item = Key>, F: FnMut() + Send + Sync + 'static>(key: Key, modifier_key: I, mut f: F) {
     let mut modifier_key_list = Vec::new();
 
     for key in modifier_key {
@@ -264,9 +268,9 @@ pub fn caps_of_modifier_key_with<I: IntoIterator<Item = Key>, F: FnMut() + 'stat
             Key::Alt |
             Key::ShiftLeft |
             Key::ShiftRight
-            => vec![key_to_code(key)],
+            => vec![key],
 
-            Key::AltGr => vec![key_to_code(Key::ControlLeft), key_to_code(Key::Alt)],
+            Key::AltGr => vec![Key::ControlLeft, Key::Alt],
 
             _ => panic!(),
         };
@@ -274,42 +278,54 @@ pub fn caps_of_modifier_key_with<I: IntoIterator<Item = Key>, F: FnMut() + 'stat
         modifier_key_list.extend(key);
     }
 
-    let key_and_fn = key_and_fn_global();
-    let mut key_and_fn = key_and_fn.write().unwrap();
-   
-
-
-    let p = &f as *const F;
-    let p = p as usize;
-
+    let ctrl = modifier_key_list.contains(&Key::ControlLeft) || modifier_key_list.contains(&Key::ControlRight);
+    let mut shift = modifier_key_list.contains(&Key::ShiftLeft) || modifier_key_list.contains(&Key::ShiftRight);
+    let mut alt = modifier_key_list.contains(&Key::Alt);
+    let meta = modifier_key_list.contains(&Key::MetaLeft) || modifier_key_list.contains(&Key::MetaRight);
     
-
-
-    todo!()
-}
-
-
-struct AtListenerFn {
-    f: Box<dyn FnMut(Keyboard) -> bool + 'static>,
-}
-
-impl AtListenerFn {
-    fn new<F: FnMut(Keyboard) -> bool + 'static>(f: F) -> Self {
-        Self {
-            f: Box::new(f),
-        }
+    if modifier_key_list.contains(&Key::AltGr) {
+        shift = true;
+        alt = true;
     }
+    
+    caps_listener_with(move |keyboard| {
+        if
+            keyboard.key == key &&
+            keyboard.ctrl == ctrl &&
+            keyboard.alt == alt &&
+            keyboard.shift == shift &&
+            keyboard.meta == meta 
+        {
+            f();
+            return true
+        }
+        false
+    });
 }
 
+/// 以按下`Caps`为前提的键盘监听
+/// 
+/// # Examples
+/// 
+/// ```
+/// use caps_shortcut::Key;
+/// caps_shortcut::caps_listener_with(|keyboard| {
+///     if keyboard.key == Key::KeyU
+///     && !keyboard.ctrl 
+///     && !keyboard.shift 
+///     && keyboard.alt 
+///     && !keyboard.meta 
+///     {
+///         println!("Cpas pressed and only KeyU with Alt pressed");
+///         true
+///     } else {
+///         false
+///     }
+/// });
+/// // caps_shortcut::run();
+/// ```
 pub fn caps_listener_with<F: FnMut(Keyboard) -> bool + Send + Sync + 'static>(f: F) {
     let mut caps_listener = caps_listener_global().write().unwrap();
-    // let at_fn = AtListenerFn::new(f);
-    // let p = &at_fn as *const AtListenerFn;
-    // let p = p as usize;
-    // caps_listener.push(p);
-    // println!("caps_listener_with ptr -> {}", p);
-
-
     caps_listener.push(Box::new(f));
 }
 
