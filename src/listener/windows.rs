@@ -329,6 +329,12 @@ pub fn caps_listener_with<F: FnMut(Keyboard) -> bool + Send + Sync + 'static>(f:
     caps_listener.push(Box::new(f));
 }
 
+/// 清除所有监听
+pub fn clear_all_listener() {
+    let mut caps_listener = caps_listener_global().write().unwrap();
+    caps_listener.clear();
+}
+
 
 pub fn run() {
     unsafe {
