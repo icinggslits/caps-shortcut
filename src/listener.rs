@@ -14,6 +14,10 @@ pub use windows::caps_of_modifier_key_with;
 pub use windows::caps_listener_with;
 #[cfg(target_os = "windows")]
 pub use windows::clear_all_listener;
+#[cfg(target_os = "windows")]
+pub use windows::freeze_listener;
+#[cfg(target_os = "windows")]
+pub use windows::unfreeze_listener;
 
 pub fn is_modifier_key(key: Key) -> bool {
     use Key::*;

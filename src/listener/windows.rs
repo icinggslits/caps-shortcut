@@ -5,10 +5,24 @@ use std::ptr::null_mut;
 use std::sync::{atomic, OnceLock, RwLock};
 use std::sync::atomic::AtomicBool;
 use rdev::Key;
+use winapi::shared::windef::HHOOK;
 use winapi::um::winuser::{CallNextHookEx, GetAsyncKeyState, GetKeyState, GetMessageW, SendInput, SetWindowsHookExW, HC_ACTION, INPUT, INPUT_KEYBOARD, KBDLLHOOKSTRUCT, KEYEVENTF_KEYUP, VK_CAPITAL, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP};
 use winapi::shared::minwindef::{LRESULT, WPARAM, LPARAM, HINSTANCE};
 use winapi::um::libloaderapi::GetModuleHandleW;
 
+static PRESSED_CTRL: AtomicBool = AtomicBool::new(false);
+static PRESSED_SHIFT: AtomicBool = AtomicBool::new(false);
+static PRESSED_ALT: AtomicBool = AtomicBool::new(false);
+static PRESSED_META: AtomicBool = AtomicBool::new(false);
+static PRESSED_CAPITAL: AtomicBool = AtomicBool::new(false);
+/// 存在非Caps按键输入
+static OTHER_KEY_INPUT: AtomicBool = AtomicBool::new(false);
+/// 触发过监听
+// static LISTENER_TRIGGERED: AtomicBool = AtomicBool::new(false);
+
+static SELF_LOCK: AtomicBool = AtomicBool::new(false);
+
+static mut HOOK: HHOOK = null_mut();
 
 #[derive(Debug, Clone, Copy)]
 pub struct Keyboard {
@@ -20,15 +34,6 @@ pub struct Keyboard {
 }
 
 
-static PRESSED_CTRL: AtomicBool = AtomicBool::new(false);
-static PRESSED_SHIFT: AtomicBool = AtomicBool::new(false);
-static PRESSED_ALT: AtomicBool = AtomicBool::new(false);
-static PRESSED_META: AtomicBool = AtomicBool::new(false);
-static PRESSED_CAPITAL: AtomicBool = AtomicBool::new(false);
-/// 存在非Caps按键输入
-static OTHER_KEY_INPUT: AtomicBool = AtomicBool::new(false);
-
-static SELF_LOCK: AtomicBool = AtomicBool::new(false);
 
 
 struct Win;
@@ -106,10 +111,14 @@ impl Win {
 
 unsafe extern "system" fn hook_proc(code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
     let self_lock = SELF_LOCK.load(atomic::Ordering::Relaxed);
+
+    // print!("HOOK: {}, code: {}, w_param: {}, l_param: {}, ", HOOK as usize, code, w_param, l_param);
+    // println!("ctrl: {}, shift: {}, alt: {}, meta: {}, other: {}", PRESSED_CTRL.load(atomic::Ordering::Relaxed), PRESSED_SHIFT.load(atomic::Ordering::Relaxed), PRESSED_ALT.load(atomic::Ordering::Relaxed), PRESSED_META.load(atomic::Ordering::Relaxed), OTHER_KEY_INPUT.load(atomic::Ordering::Relaxed));
+
     if !self_lock {
         if code == HC_ACTION as i32 {
             let kb_struct = *(l_param as *const KBDLLHOOKSTRUCT);
-            
+            // print!("flags: {}, scan_code: {}, time: {}", kb_struct.flags, kb_struct.scanCode, kb_struct.time);
     
             if w_param == WM_KEYDOWN as WPARAM || w_param == 260 {
                 let vk_code = kb_struct.vkCode as i32;
@@ -122,35 +131,36 @@ unsafe extern "system" fn hook_proc(code: i32, w_param: WPARAM, l_param: LPARAM)
                 match vk_code {
                     VK_CAPITAL => {
                         PRESSED_CAPITAL.store(true, atomic::Ordering::Relaxed);
-                        return 1
+                        intercept = true;
                     }
                     VK_MENU | VK_LMENU | VK_RMENU => {
                         PRESSED_ALT.store(true, atomic::Ordering::Relaxed);
                         if pressed_capital {
-                            return 1
+                            intercept = true;
                         }
                     }
                     VK_CONTROL | VK_LCONTROL | VK_RCONTROL => {
                         PRESSED_CTRL.store(true, atomic::Ordering::Relaxed);
                         if pressed_capital {
-                            return 1
+                            intercept = true;
                         }
                     }
                     VK_SHIFT | VK_LSHIFT | VK_RSHIFT => {
                         PRESSED_SHIFT.store(true, atomic::Ordering::Relaxed);
                         if pressed_capital {
-                            return 1
+                            intercept = true;
                         }
                     }
                     VK_LWIN | VK_RWIN => {
                         PRESSED_META.store(true, atomic::Ordering::Relaxed);
                         if pressed_capital {
-                            return 1
+                            intercept = true;
                         }
                     }
                     _ => {
                         if pressed_capital {
                             OTHER_KEY_INPUT.store(true, atomic::Ordering::Relaxed);
+                            // intercept = true;
                         }
                     }
                 }
@@ -164,7 +174,7 @@ unsafe extern "system" fn hook_proc(code: i32, w_param: WPARAM, l_param: LPARAM)
                         let _intercept = f(keyboard);
         
                         if !intercept && _intercept {
-                            
+                            // LISTENER_TRIGGERED.store(true, atomic::Ordering::Relaxed);
                             intercept = true;
                         }
                         
@@ -177,11 +187,12 @@ unsafe extern "system" fn hook_proc(code: i32, w_param: WPARAM, l_param: LPARAM)
                 
             } else if w_param == WM_KEYUP as WPARAM || w_param == 261 {
     
-                let vk_code = kb_struct.vkCode as i32;    
+                let vk_code = kb_struct.vkCode as i32;
                 
                 match vk_code {
                     VK_CAPITAL => {
                         PRESSED_CAPITAL.store(false, atomic::Ordering::Relaxed);
+                        // LISTENER_TRIGGERED.store(false, atomic::Ordering::Relaxed);
                         if !OTHER_KEY_INPUT.load(atomic::Ordering::Relaxed) {
                             SELF_LOCK.store(true, atomic::Ordering::Relaxed);
                             std::thread::spawn(|| {
@@ -191,6 +202,7 @@ unsafe extern "system" fn hook_proc(code: i32, w_param: WPARAM, l_param: LPARAM)
                             // NEED_RESTORE.store(false, atomic::Ordering::Relaxed);
                         }
                         OTHER_KEY_INPUT.store(false, atomic::Ordering::Relaxed);
+                        return 1
                     }
                     VK_MENU | VK_LMENU | VK_RMENU => {
                         PRESSED_ALT.store(false, atomic::Ordering::Relaxed);
@@ -207,11 +219,25 @@ unsafe extern "system" fn hook_proc(code: i32, w_param: WPARAM, l_param: LPARAM)
                     _ => (),
                 }
                 
+                // if PRESSED_CAPITAL.load(atomic::Ordering::Relaxed) {
+                    // return 1
+                // }
             }
         }
     }
+
+    if !Win::ctrl() && !Win::shift() && !Win::shift() && !Win::meta() && !Win::capital() {
+        PRESSED_CTRL.store(false, atomic::Ordering::Relaxed);
+        PRESSED_ALT.store(false, atomic::Ordering::Relaxed);
+        PRESSED_SHIFT.store(false, atomic::Ordering::Relaxed);
+        PRESSED_META.store(false, atomic::Ordering::Relaxed);
+        PRESSED_CAPITAL.store(false, atomic::Ordering::Relaxed);
+    }
+
+
     // 继续执行下一个钩子
-    CallNextHookEx(null_mut(), code, w_param, l_param)
+    // CallNextHookEx(null_mut(), code, w_param, l_param)
+    CallNextHookEx(HOOK, code, w_param, l_param)
 }
 
 static KEY_AND_FN: OnceLock<RwLock<HashMap<(u32, Vec<u32>), Box<dyn FnMut() + Send + Sync>>>> = OnceLock::new();
@@ -251,12 +277,12 @@ pub fn caps_with<F: FnMut() + Send + Sync + 'static>(key: Key, f: F) {
 /// 
 /// # Examples
 /// 
-/// ```
+/// ```no_run
 /// use caps_shortcut::Key;
 /// caps_shortcut::caps_of_modifier_key_with(Key::KeyI, [Key::Alt, Key::ControlLeft], || {
 ///      println!("Cpas, Control, Alt and KeyI pressed");
 /// });
-/// // caps_shortcut::run();
+/// caps_shortcut::run();
 /// ```
 pub fn caps_of_modifier_key_with<I: IntoIterator<Item = Key>, F: FnMut() + Send + Sync + 'static>(key: Key, modifier_key: I, mut f: F) {
     let mut modifier_key_list = Vec::new();
@@ -307,7 +333,7 @@ pub fn caps_of_modifier_key_with<I: IntoIterator<Item = Key>, F: FnMut() + Send 
 /// 
 /// # Examples
 /// 
-/// ```
+/// ```no_run
 /// use caps_shortcut::Key;
 /// caps_shortcut::caps_listener_with(|keyboard| {
 ///     if keyboard.key == Key::KeyU
@@ -322,7 +348,7 @@ pub fn caps_of_modifier_key_with<I: IntoIterator<Item = Key>, F: FnMut() + Send 
 ///         false
 ///     }
 /// });
-/// // caps_shortcut::run();
+/// caps_shortcut::run();
 /// ```
 pub fn caps_listener_with<F: FnMut(Keyboard) -> bool + Send + Sync + 'static>(f: F) {
     let mut caps_listener = caps_listener_global().write().unwrap();
@@ -335,11 +361,31 @@ pub fn clear_all_listener() {
     caps_listener.clear();
 }
 
+/// 冻结所有监听
+/// 
+/// 可能会影响修饰键的变量储存
+pub fn freeze_listener() {
+    SELF_LOCK.store(true, atomic::Ordering::Relaxed);
+}
+
+/// 解冻所有监听
+/// 
+/// 可能会影响修饰键的变量储存
+pub fn unfreeze_listener() {
+    SELF_LOCK.store(false, atomic::Ordering::Relaxed);
+    
+}
+
 
 pub fn run() {
     unsafe {
         let h_instance: HINSTANCE = GetModuleHandleW(null_mut());
-        let _hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), h_instance, 0);
+        let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), h_instance, 0);
+
+        if hook.is_null() {
+            panic!("Failed to set hook")
+        }
+
         let mut msg = std::mem::zeroed();
         GetMessageW(&mut msg, null_mut(), 0, 0);
     }
